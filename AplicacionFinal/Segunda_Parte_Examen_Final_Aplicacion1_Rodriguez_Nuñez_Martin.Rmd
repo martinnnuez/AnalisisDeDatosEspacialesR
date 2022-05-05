@@ -1,0 +1,519 @@
+---
+title: "Examen final: Aplicacion 1 en R"
+author: "Rodriguez Nuñez Martin"
+date: "22/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##  Cargo librerias
+
+```{r}
+# Librerias 
+library(spdep)
+library(gstat)
+library(geoR)
+library(mapview)
+library(raster)
+library(leaflet)
+library(RColorBrewer)
+library(PerformanceAnalytics)
+library(ggplot2)
+library(caret)
+library(parallel)
+library(nlme)
+library(sf)
+library(stars)
+```
+
+
+## Cargo base de datos MO_Córdoba
+
+```{r}
+# Carga de base de datos
+datos <- read.table("MO_Córdoba.txt", header = T)
+head(datos)
+names(datos)
+str(datos)
+```
+
+Se puede ver que la base de datos cuenta con 340 observaciones y 13 variables observadas. Entre ellas se encuentran el contenido de materia organica del suelo (MO). Además de posibles covariables como el NDVI (índice de vegetación normalizado promedio), Pendiente del terreno, ETPmed (evapotranspiración median anual), LC_Bosque (% de superficie del entorno con cobertura de bosque). 
+Cada uno de los 340 puntos cuenta con información de las coordenadas (x e y).
+
+##  Cargo la base de datos grilla3000m_Cba
+
+```{r}
+# Carga de base de datos
+grilla <- read.table("grilla3000m_Cba.txt", header = T)
+head(grilla)
+names(grilla)
+str(grilla)
+
+```
+
+Por otra parte la base de datos grilla3000m_Cba presenta la información de 18436 observaciones para un total de 6 variables. Esta base hace referencia a un conjunto de puntos dispuestos en forma regular y separados a una distancia de 3 km, para toda la provincia de Cordoba. En cada punto se tiene información de las coordenadas (x e y) ademas de los valores de algunas covariables (NDVI, Pendiente, ETPmed, LC_Bosque).
+
+Esta segunda base de datos no cuenta con la principal variable de interes en el analisis que es el contenido de materia organica del suelo, por lo que a partir de las variables predictoras observadas en los sitios de la base de datos grilla se buscara predecir la variable de interes (MO). 
+
+##  Consignas
+A partir de los datos provistos (muestra) el objetivo del presente es predecir el contenido de MO en sitios no observados del dominio de interés (provincia de Córdoba). Se solicita realizar un análisis geoestadístico con soporte computacional y presentar los principales resultados del análisis en base a los siguientes puntos:
+
+
+##  1) Realice un análisis descriptivo de los datos (medidas resumen, distribución de la variable, evaluación de tendencia).
+
+### Graficos Exploratorios
+```{r}
+chart.Correlation(datos[, 1:7], histogram = TRUE, pch = 19)
+chart.Correlation(datos[, c(1,seq(7,13,1))], histogram = TRUE, pch = 19)
+```
+Se puede ver que el contenido de materia organica es una variable respuesta con una leve asimetria positiva y que no se encuentra fuertemente correlacionada con ninguna de las variables, a pesar que tiene una correlacion moderada con algunas de ellas. 
+
+Por otra parte, se pueden observar fuertes correlaciones entre las distintas variables observadas, como lo es el caso de TW y LS_Factor, PPmed y EPTmed, PPmed y Tmed, altura y pendiente, x y altura.
+
+A partir del grafico de puntos se puede ver algunas variables predictores que parecen tener una tendencia lineal positiva con el contenido de materia organica, estas son:
+
+* NDVI con un coeficiente de correlacion de 0.37.
+* LS_factor con un coeficiente de correlacion de 0.38.
+* Pendiente con un coeficiente de correlacion de 0.42.
+* Altura con un coeficiente de correlacion de 0.36.
+* La coordenada y con un coeficiente de correlacion de 0.42.
+
+Por otra parte se nota una tendencia lineal negativa con el contenido de materia organica por parte de las variables:
+* TW con un coeficiente de correlacion de -0.42.
+* Tmed con un coeficiente de correlacion de -0.34.
+
+La mayoria de las correlaciones observadas son signifcativas y esto podria estar indicando que existe una verdadera tendencia que deberiamos quitar a los datos antes de trabajar con ellos, por lo que lo mas adecuado para trabajar con esta base podria ser un krigging con deriva externa o con un kirgging combinado con algun metodo de regresion. 
+
+### Analisis Grafico:
+
+```{r}
+datos <- st_as_sf(datos, coords = c("x", "y"), crs = 22174)
+datos
+# Visualizacion
+plot(datos)
+```
+A partir de este grafico se puede analizar la variabilidad de cada una de las variables que se encuentran en la base de datos. Se aprecia que las que varian mayormente son la temperatura media y presipitacion media. Luego en menor medida  las variables TWI y la evapotranspiracion media, seguidas por el contenido de materia organica y el NDVI. Las restantes variables se mantienen relativamente constantes a lo largo del territorio provincial. 
+
+#### Concentro analisis en el contenido de materia organica:
+```{r}
+plot(
+  datos["MO"],
+  key.pos = 4,
+  axes = TRUE,
+  key.width = lcm(1.5),
+  key.length = 1,
+  pal = terrain.colors
+)
+```
+Se puede ver que el indice de materia organica parece aumentar a medida que nos movemos hacia el norte de la provincia, mientras que al sur de la misma parece registrar valores bajos. Esto se encuentra sostenido por la correlacion positiva encontrada con la variable de localizacion y. Ademas este contenido aumenta a medida que nos acercamos a las Sierras de Cordoba, lo que se encuentra sostenido por la fuerte correlacion que existe con la variable altura.  
+
+##  2) Realice el ajuste de semivariogramas empíricos y teóricos considerando diferentes modelos de correlación espacial suponiendo un proceso estacionario. Seleccione el modelo de acuerdo con criterios de bondad de ajuste.
+
+### Ajuste semivariograma empirico suponiendo un proceso estacionario:
+```{r}
+semi_exp <- variogram(MO ~ 1, datos)
+plot(semi_exp)
+semi_exp
+```
+
+En el semivariograma experimental ajustado, puede verse que a partir de los 150000 metros este tiende a estabilizarse. Al ser la cantidad de puntos con los cuales se calcula cada uno de estos coeficientes mayor a 30 sus resultados son confiables. Ademas se aprecian 15 semivarianzas estimadas.
+
+El calculo del primer coeficiente de semivarianza, es muy importante debido a que define el nugget, y es el que con menor cantidad de puntos se encuentra calculado, por este motivo procedere a modificar el parametro de width para mejorar esta estimacion. Ademas de ello tambien analizare como varia la semivarianza al aumentar la distancia para el calculo de los coeficientes con el parametro cutoff. 
+
+```{r}
+semi_exp <- variogram(MO ~ 1, datos,width=18000,cutoff=2000000)
+plot(semi_exp)
+semi_exp
+```
+El semivariograma experimental obtenido se encuentra calculado con una mayor cantidad de puntos por coeficiente, es decir que sus valores son mas confiables. Ademas al analizar una distancia mayor a la previamente graficada, se puede ver que el semivariograma sigue una tendencia que parece nunca estabilizarse aumentando continuamente. Esto habla de una clara tendencia existente en la varible que estamos ajustando. A partir del analisis conlcluyo que se trata de un prceso no estacionario, con una clara tendencia que esperamos poder corregir con la inclucion de algunas covariables en el modelo. 
+
+### Ajuste semivariograma teorico suponiendo un proceso estacionario:
+```{r}
+# Ajuste automatico de modelos
+v.fit_todos <- fit.variogram(semi_exp, vgm(c("Exp", "Sph", "Gau")))
+plot(semi_exp, v.fit_todos)
+attr(v.fit_todos, 'SSErr')
+v.fit_todos
+
+
+```
+Se puede apreciar que el mejor modelo teorico que ajusta a los datos es el exponencial con un nugget de 0.3714324	y un rango de 145218.2. Pero volveremos a modelar todo con tendencia como consecuencia de lo observado previamente. 
+
+##  3) Realice el ajuste de semivariogramas empíricos y teóricos incluyendo tendencias para las covariables relevadas y/o coordenadas.
+
+### Ajuste semivariograma empirico con tendencia:
+Para corregir el problema de la inestabilizacion del semivariograma, voy a proceder a incluir tendencia para las covariables relevadas. Para comenzar incluire solo las variables que se encuentran relevadas en los puntos donde el objetivo es predecir la variable contenido de materia organica ya que es desconocido. De este modo si logro la estabilizacion con estas variables me favoreceria mucho para poder obtener predicciones con un modelo adecuado en estos sitios. Las variables recopiladas en los sitios donde el contenido de materia organica es desconocido son:
+* La coordenada x.
+* La coordenada y.
+* El NDVI.  
+* La evapotranspiracion media.     
+* La Pendiente.  
+* El LC_Bosques.
+
+Para determinar cuales variables seran las que incluire en el modelo, procedere a ajustar una regresion multiple con un procedimiento de seleccion de variables del tipo stepwise.
+
+
+
+```{r}
+datos2 <- read.table("MO_Córdoba.txt", header = T)
+lm.full <- lm(MO ~ x + y + NDVI + EPTmed + Pendiente + LC_Bosques, data = datos2)
+lm.null <- lm(MO ~ 1, data = datos2)
+coordinates(datos2) = ~x+y
+```
+
+
+```{r}
+model.aic.both <- step(lm.null, direction = "both", trace = 1, scope = ~ x + y + NDVI + EPTmed + Pendiente + LC_Bosques)
+summary(model.aic.both)
+```
+La unica variable que no quedo seleccionada por este metodo para ser incluida en el modelo es la variable LC_Bosques por lo que no sera incluida en el ajuste con tendencia.
+
+```{r}
+semi_exp_trend <-
+  variogram(MO ~ x+y+NDVI + EPTmed + Pendiente, data = datos2, width=18000,cutoff=2000000)
+plot(semi_exp_trend)
+semi_exp_trend
+```
+Al ajustar el semivariograma experimental con tendencia vemos que tiende a estabilizarse, a pesar de tener algunos valores que a grandes distancias comienzan a aumentar su semivarianza. Por lo tanto el modelo es aceptable, a partir del analisis grafico se puede ver que el rango es de 100000 y el efecto nugget de 0.38. Puede afirmarse que al ser la cantidad de puntos con las cuales se calcula cada uno de estos coeficientes es mayor a 30 sus resultados son confiables.
+
+### Ajuste semivariograma teorico suponiendo un proceso estacionario:
+
+```{r}
+v.fit_todos_trend <-
+  fit.variogram(semi_exp_trend, vgm(nugget=0.39, range=100000,model=c("Exp", "Sph", "Gau")))
+plot(semi_exp_trend, v.fit_todos_trend)
+attr(v.fit_todos_trend, 'SSErr')
+v.fit_todos_trend
+```
+El mejor modelo teorico que ajusta al semivariograma definiendo el nugget y el rango parece ser el exponencial con una suma de residuos cuadrados minima de 1.728778e-09.
+
+##  4) Obtenga la predicción espacial utilizando sólo la información de la variable respuesta (kriging ordinario) e incluyendo las covariables en el análisis (kriging regresión o random forest kriging).
+
+### Kriging Ordinario
+```{r}
+library(gstat)
+# Generacion de grilla de prediccion
+gr <- pred_grid(grilla, by = 3000)
+plot(gr)
+gri <- polygrid(gr, bor = grilla)
+plot(gri)
+
+names(gri)[1] <- paste("x")
+names(gri)[2] <- paste("y")
+gridded(gri) = ~ x + y
+plot(gri)
+
+gri <- st_as_sf(gri)
+st_crs(gri) <- 22174
+gri
+# mapview(gri)
+
+# Cargo nuevamente los datos
+datos <- read.table("MO_Córdoba.txt", header = T)
+datos <- st_as_sf(datos, coords = c("x", "y"), crs = 22174)
+# coordinates(datos) = ~x+y
+
+# Kriging Ordinario
+v.fit_todos
+f.1 <- as.formula(MO ~ 1)
+kriging_grilla <- gstat::krige(f.1, datos, gri, v.fit_todos)
+
+plot(kriging_grilla["var1.pred"],
+     main = "Kriging Ordinario: Predicciones",
+     pal = terrain.colors,
+     pch = 16)
+
+plot(kriging_grilla["var1.var"], main = "Kriging Ordinario: Varianza", pal =
+       terrain.colors)
+
+kriging_grilla$DE_pred <- sqrt(kriging_grilla$var1.var)
+head(kriging_grilla)
+
+plot(kriging_grilla["DE_pred"],
+     main = "Kriging Ordinario: DE",
+     pal = terrain.colors,
+     pch = 16)
+
+```
+
+En esta parte del codigo se puede observar todo el procedimiento necesario para poder realizar las predicciones del contenido de materia organica en los puntos que esta variable es desconocida. Lo primero que debe hacerse es crear una grilla de puntos regular con las distancias a las cuales se encuentran separados los puntos en los cuales se quiere predecir, en este caso 3000 metros. 
+
+Luego esa grilla regular es recortada con el objetivo de solo incluir los puntos que realmente son de interes o que tenemos definidos. Ademas se define el sistema de coordendas de referencia para la provincia de Cordoba en Argentina. Finalmente generamos una visualizacion para cersiorarnos de que los puntos hayan sido cargados adecuadamente. 
+
+Luego se procede a la interpolacion de los valores desconocidos por medio de kriging ordinario suponiendo un modelo estacionario donde la variable respuesta no incluye ninguna variable regresora. 
+
+A partir de las predicciones obtenidas, podemos observar que el contenido de materia organica en el modelo de independencia parece estar fuertemente correlacionado con la altura como consecuencia de que los mayores contenidos se dan a medida que nos aproximamos a las Sierras de Cordoba (aumenta la altura) y a medida que nos alejamos de ella estos comienzan a disminuir. La varianza de las predicciones parece ser baja en la mayor parte del terreno de la provincia.
+
+### Kriging Ranfom Forest
+
+Decidi optar por el kriging Random Forest, ya que a pesar de ser pocas las covariables concideradas en el modelo con tendencia, estas describen correlaciones que prefiero controlar. El algoritmo de Random Forest genera una seleccion aleatoria de las variables predictoras al construir cada uno de los arboles del desierto, de esta forma al tomar solo "mtry" variables en la construccion de cada uno de ellos combate la correlacion existente entre los predictores.
+
+```{r}
+# Ajuste del RF con libreria caret
+seed <- 7
+
+# Grilla de hiperparametro del mtry
+mtry <- expand.grid(mtry = seq(2, 5, 1))
+
+# 10 fold cross validation
+fitControl <-
+  trainControl(method = "cv",
+               number = 10,
+               allowParallel = T)
+
+
+datos2 <- read.table("MO_Córdoba.txt", header = T)
+
+# Ajuste del modelo de RF
+set.seed(seed)
+train_rf <-
+  train(
+    MO ~ x+y+NDVI + EPTmed + Pendiente,
+    data = datos2,
+    method = "rf",
+    importance = T, 
+    tuneGrid = mtry, 
+    trControl = fitControl
+  )
+
+# Incorporamos los residuos del MLR a la base de datos
+datos2$residuosRF <- datos2$MO - predict(train_rf, newdata = datos2)
+
+coordinates(datos2) = ~x+y
+
+# Ajuste de semivariograma experimetal y teorico a los residuos del RF
+# datos2 <- st_as_sf(datos2, coords = c("x", "y"), crs = 22174)
+
+semi_exp_trend <-
+  variogram(residuosRF ~ x + y + NDVI + EPTmed + Pendiente, data = datos2, width=18000,cutoff=2000000)
+plot(semi_exp_trend)
+semi_exp_trend
+
+v.fit_todos_trend <-
+  fit.variogram(semi_exp_trend, vgm(nugget = 0.095, range = 160000, model=c("Exp", "Sph", "Gau", "Mat")))
+plot(semi_exp_trend, v.fit_todos_trend)
+attr(v.fit_todos_trend, 'SSErr')
+v.fit_todos_trend
+
+# Vuelvo a cargar la grilla
+gr <- pred_grid(grilla, by = 3000)
+gri <- polygrid(gr, bor = grilla)
+names(gri)[1] <- paste("x")
+names(gri)[2] <- paste("y")
+gridded(gri) = ~ x + y
+gri <- st_as_sf(gri)
+st_crs(gri) <- 22174
+
+# Vuelvo a cargar los datos
+datos2 <- read.table("MO_Córdoba.txt", header = T)
+datos2$residuosRF <- datos2$MO - predict(train_rf, newdata = datos2)
+datos2 <- st_as_sf(datos2, coords = c("x", "y"), crs = 22174)
+
+# Kriging sobre residuos del RF
+f.1 <- as.formula(residuosRF ~ 1)
+kgresRF <- krige(f.1 , datos2, gri, model = v.fit_todos_trend)
+
+plot(kgresRF["var1.pred"],
+     main = "Kriging Residual (RF): Predicciones",
+     pal = terrain.colors,
+     pch = 16)
+
+# Generacion de grilla de prediccion para el Ranfom Forest:
+gr <- pred_grid(grilla, by = 3000)
+plot(gr)
+gri <- polygrid(gr, bor = grilla)
+rn<-rownames(gri)
+names(gri)[1] <- paste("x")
+names(gri)[2] <- paste("y")
+plot(gri)
+
+grilla$RFK_pred <-predict(train_rf, newdata = grilla)
+
+gridded(gri) = ~ x + y
+gri <- st_as_sf(gri)
+st_crs(gri) <- 22174
+# mapview(gri)
+
+# Cargo los valores de las covariables en la grilla de prediccion.
+gri$NDVI<-0
+gri$EPTmed<-0
+gri$Pendiente<-0
+gri$LC_Bosques<-0
+gri$RFK_pred<-0
+for(i in rn){
+  gri[i,c("NDVI","EPTmed","Pendiente","LC_Bosques","RFK_pred")]<-grilla[i,c("NDVI","EPTmed","Pendiente","LC_Bosques","RFK_pred")]
+}
+
+# Eliminamos todas las filas que tengan prediccion 0, lo que quiere decir que los valores de las variables son cero:
+gri<-gri[-which(gri$RFK_pred==0),]
+
+# Aqui complemento el random forest con el kriging en las ubicaciones deseadas:
+gri$RFK_pred+kgresRF$var1.pred
+
+plot(gri["RFK_pred"],
+     main = "Prediccion RFK",
+     pal = terrain.colors,
+     pch = 16)
+
+```
+Podemos ver que la optimizacion del hiper parametro arroja un mtry de 2, que es donde se minimiza el RMSE, era de esperar que por la baja cantidad de variables predictoras incluidas en el modelo este parametro tome valores bajos. Luego procedo a calcular los residuos del modelo.
+
+Ajustamos un semivariograma experimental a los residuos. Este semivariograma varia respecto al anteriormente ajustado sobre la variable respuesta en sentido que vemos que el efecto nugget decrece notablemente a un valor de 0.095 y el rango parece aumentar a un valor de 160000.
+
+De esta forma procedemos a seleccionar un modelo teorico para el semivariograma. A pesar de no converger luego de 200 iteraciones, procedemos a seleccionar el mejor modelo que guardado, este es un Matteron con parametros sill de 0.1123919, rango de 8032.806 y kappa de 0.5.
+
+Con el modelo teorico ajustado procedemos a realizar la prediccion de los residuos mediante krigging ordinario. Luego la prediccion del Random Forest la complementamos con la de los residuos con Kriging Ordinario y obtenemos la prediccion final del contenido de materia organica en los distintos sitios de interes. 
+
+A partir del mapa de las predicciones se puede ver una tendencia espacial de las predicciones totalmente distinta a la conlcluida anteriormente por Kriging Ordinario suponiendo un proceso estacionario, es decir sin incluir tendencia. En este caso se puede ver 3 zonas con mayores contenidos de materia organica, estas se ubican en la parte central de la provincia de Cordoba al este, sur y oeste respectivamente. A partir de esto se puede concluir que a traves de la implementacion de este metodo se elimino la clara tendencia que se veia en los datos cuando no se ajustaba un modelo de independencia. 
+
+##  5) Evalué y comprare la calidad de la predicción de los métodos utilizados (error de predicción).
+
+
+```{r}
+validacion <- function (fold, base, var.y) {
+  require(caret)
+  require(gstat)
+  require(sp)
+  
+  datos <- read.table(base, head = T)
+  names(datos)[names(datos) == var.y] <- "Y"
+  
+  if (base == "petrel.txt") {
+    names(datos)[names(datos) == 'long'] <- "x"
+    names(datos)[names(datos) == 'lat'] <- "y"
+  }
+  
+  seed <- 7
+  
+  set.seed(seed)
+  datos$id <-
+    sample(rep(1:10, nrow(datos), length.out = nrow(datos)))
+  
+  list <- 1:10
+  prediccion <- data.frame()
+  testset <- data.frame()
+  
+  training <- subset(datos, id %in% list[-fold])
+  testing <- subset(datos, id %in% c(fold))
+  
+  # Kriging Ordinario
+  train_ko = training
+  test_ko = testing
+  coordinates(train_ko) <-  ~ x + y
+  coordinates(test_ko) <-  ~ x + y
+  vario <- variogram(Y ~ 1, train_ko)
+  VF_vut_KO <- fit.variogram(vario, vgm(c("Sph", "Exp", "Gau")))
+  KO <- krige(Y ~ 1, train_ko, test_ko, VF_vut_KO)
+  
+  # Regression Kriging
+  train_ko = training
+  test_ko = testing
+  
+  coordinates(train_ko) <-  ~ x + y
+  coordinates(test_ko) <-  ~ x + y
+  
+  mlr <- lm(Y ~ x + y + NDVI + EPTmed + Pendiente , training)
+  
+  pred_mlr = predict(mlr, newdata = test_ko)
+  
+  inside_rk <- predict(mlr, newdata = train_ko)
+  train_ko$error_rk <- training$Y - inside_rk
+  
+  vario_rk <- variogram(error_rk ~ 1, train_ko)
+  model_rk_ko <-
+    fit.variogram(vario_rk, vgm(nugget = 0.095, range = 160000, model=c("Exp", "Sph", "Gau", "Mat")))
+  
+  test_k <- krige(error_rk ~ 1 , train_ko, test_ko, model_rk_ko)
+  test_rk_ko <- pred_mlr + test_k$var1.pred
+  
+  # Random Forest
+  #fitControl <- trainControl(method = "cv", number = 10)
+  fitControl <- trainControl(method = "none")
+  #mtry <-data.frame(mtry=2)
+  set.seed(seed)
+  
+  rf <- train(
+    Y ~ x + y + NDVI + EPTmed + Pendiente,
+    data = training,
+    method = "rf",
+    #tuneGrid =mtry,
+    trControl = fitControl,
+    verbose = FALSE
+  )
+  
+  test_rf <- predict(rf, newdata = testing)
+  
+  # Random Forest + Kriging Ordinario
+  inside_rf <- predict(rf, newdata = training)
+  
+  train_ko = training
+  test_ko = testing
+  
+  coordinates(train_ko) <-  ~ x + y
+  coordinates(test_ko) <-  ~ x + y
+  
+  train_ko$error_rf <- training$Y - inside_rf
+  vario_rf <- variogram(error_rf ~ 1, train_ko)
+  model_rf_ko <-
+    fit.variogram(vario_rf, vgm(nugget = 0.095, range = 160000, model=c("Exp", "Sph", "Gau", "Mat")))
+  test_ko <- krige(error_rf ~ 1 , train_ko, test_ko, model_rf_ko)
+  test_rf_ko <- test_rf + test_ko$var1.pred
+  
+  
+  # Tabla observados y predichos
+  testset <- rbind(testset, as.data.frame(testing[, "Y"]))
+  result <- data.frame(
+    data.frame(
+      "x" = testing$x,
+      "y" = testing$y,
+      "k-fold" = fold,
+      "Observado" = testset[, 1],
+      "KO" = KO$var1.pred,
+      "RK" = test_rk_ko,
+      "RF" = test_rf,
+      "RF_KO" = test_rf_ko
+    )
+  )
+  
+  return(result)
+  
+}
+
+num_cores <- detectCores() - 1
+cl <- makeCluster(num_cores)
+system.time(resultados <-
+              do.call(
+                rbind,
+                parLapply(cl, 1:10, validacion, base = "MO_Córdoba.txt", var.y =
+                            "MO")
+              ))
+
+tabla <- resultados[, 4:8]
+resumen <- function (j) {
+  ME <- mean(tabla [, j] - tabla[, "Observado"])
+  MAE <- mean(abs(tabla [, j] - tabla[, "Observado"]))
+  MAPE <-
+    mean(abs(tabla [, j] - tabla[, "Observado"]) / tabla[, "Observado"]) *
+    100
+  MSE <- mean((tabla [, j] - tabla[, "Observado"]) ^ 2)
+  RMSE <- sqrt(mean((tabla [, j] - tabla[, "Observado"]) ^ 2))
+  nRMSE <- sqrt(MSE) / mean(tabla[, "Observado"]) * 100
+  rLM <- lm(tabla [, j] ~ tabla[, "Observado"])
+  R2 <- as.matrix(summary(rLM)$adj.r.squared)
+  mx <- mean(tabla[, "Observado"])
+  my <- mean(tabla [, j])
+  s2x <- var(tabla[, "Observado"])
+  s2y <- var(tabla [, j])
+  sxy <- mean((tabla[, "Observado"] - mx) * (tabla [, j] - my))
+  resumen <-
+    data.frame("Modelo" = names(tabla [j]), ME, MAE, MAPE, MSE, RMSE, nRMSE, R2)
+  return(resumen)
+}
+
+tablafinal <- do.call("rbind", lapply(2:5, resumen))
+tablafinal
+```
+A partir de los resultados obtenidos podemos ver que en estos datos el modelo de Random Forest sin Kriging ofrece muy buenos resultados, es el algoritmo que minimiza el RMSE. Ademas la combinacion de este algoritmo con el Kriging Oridinario no mejora los resultados previamente obtenidos. Por otra parte el Random Forest con Kriging Ordinario si mejora respecto al Kriging Ordinario y al Regresion Kriging. 
